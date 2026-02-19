@@ -33,14 +33,11 @@ app = Flask(__name__)
 S3_BUCKET = os.getenv("S3_BUCKET", "huski-tmp-new")
 S3_REGION = os.getenv("AWS_REGION", "us-east-1")
 
-# Initialize S3 client
-aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
-aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
-
-if not aws_access_key or not aws_secret_key:
-    print(
-        "WARNING: AWS credentials not found. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables."
-    )
+# Initialize S3 client - reads from ~/.aws/credentials by default
+s3_client = boto3.client(
+    "s3",
+    region_name=S3_REGION,
+)
     s3_client = None
 else:
     s3_client = boto3.client(
@@ -132,9 +129,6 @@ def get_video():
 @app.route("/api/upload-s3", methods=["POST"])
 def upload_to_s3():
     """Download video and upload to S3."""
-    if not s3_client:
-        return jsonify({"error": "AWS credentials not configured"}), 500
-
     data = request.get_json()
     video_url = data.get("url")
     title = data.get("title", "video")
