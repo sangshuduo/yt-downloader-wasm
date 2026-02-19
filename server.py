@@ -38,14 +38,9 @@ s3_client = boto3.client(
     "s3",
     region_name=S3_REGION,
 )
-    s3_client = None
-else:
-    s3_client = boto3.client(
-        "s3",
-        region_name=S3_REGION,
-        aws_access_key_id=aws_access_key,
-        aws_secret_access_key=aws_secret_key,
-    )
+
+# Store active uploads for progress tracking
+active_uploads = {}
 
 
 @app.route("/")
@@ -128,7 +123,7 @@ def get_video():
 
 @app.route("/api/upload-s3", methods=["POST"])
 def upload_to_s3():
-    """Download video and upload to S3."""
+    """Download video and stream upload to S3 (low memory usage)."""
     data = request.get_json()
     video_url = data.get("url")
     title = data.get("title", "video")
@@ -212,30 +207,76 @@ def upload_to_s3():
         unique_id = str(uuid.uuid4())[:8]
         s3_key = f"youtube/{safe_title}_{timestamp}_{unique_id}.mp4"
 
-        # Download video content
-        print(f"Downloading video from: {direct_url[:80]}...", file=sys.stderr)
+        # Stream download and upload to S3 (low memory usage)
+        print(f"Starting stream upload to S3: {s3_key}", file=sys.stderr)
 
         req = urllib.request.Request(direct_url)
         req.add_header("User-Agent", "Mozilla/5.0")
-        req.add_header("Range", "bytes=0-")  # Support partial content
 
-        # Use longer timeout for download
+        # Use streaming upload with multipart
         response = urllib.request.urlopen(req, timeout=300)
-        video_data = response.read()
-        response.close()
 
-        print(
-            f"Downloaded {len(video_data)} bytes, uploading to S3...", file=sys.stderr
+        # Initialize multipart upload
+        multipart_upload = s3_client.create_multipart_upload(
+            Bucket=S3_BUCKET, Key=s3_key, ContentType="video/mp4"
         )
+        upload_id = multipart_upload["UploadId"]
 
-        # Upload to S3
-        s3_client.put_object(
-            Bucket=S3_BUCKET,
-            Key=s3_key,
-            Body=video_data,
-            ContentType="video/mp4",
-            ACL="public-read",
-        )
+        parts = []
+        part_number = 1
+        total_bytes = 0
+
+        try:
+            # Upload parts in chunks
+            chunk_size = 5 * 1024 * 1024  # 5MB chunks
+
+            while True:
+                chunk = response.read(chunk_size)
+                if not chunk:
+                    break
+
+                total_bytes += len(chunk)
+
+                # Upload this part
+                part = s3_client.upload_part(
+                    Bucket=S3_BUCKET,
+                    Key=s3_key,
+                    PartNumber=part_number,
+                    UploadId=upload_id,
+                    Body=chunk,
+                    ContentLength=len(chunk),
+                )
+                parts.append({"PartNumber": part_number, "ETag": part["ETag"]})
+                part_number += 1
+
+                print(
+                    f"Uploaded part {part_number - 1}, total: {total_bytes / (1024 * 1024):.1f}MB",
+                    file=sys.stderr,
+                )
+
+            response.close()
+
+            # Complete multipart upload
+            s3_client.complete_multipart_upload(
+                Bucket=S3_BUCKET,
+                Key=s3_key,
+                UploadId=upload_id,
+                MultipartUpload={"Parts": parts},
+            )
+
+            print(
+                f"Upload complete: {total_bytes / (1024 * 1024):.1f}MB", file=sys.stderr
+            )
+
+        except Exception as upload_err:
+            # Abort multipart upload on error
+            try:
+                s3_client.abort_multipart_upload(
+                    Bucket=S3_BUCKET, Key=s3_key, UploadId=upload_id
+                )
+            except:
+                pass
+            raise upload_err
 
         # Generate S3 URL
         s3_url = f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{s3_key}"

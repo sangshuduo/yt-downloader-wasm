@@ -68,6 +68,29 @@ A web-based YouTube video downloader that runs in the browser and uploads direct
 - 🚀 **Concurrent Downloads** - Support for multiple simultaneous downloads
 - ⚡ **WASM Powered** - Fast URL validation using WebAssembly
 
+## Why Server-Side Processing?
+
+### WASM Limitation
+
+While the project uses WebAssembly (WASM) for URL validation in the browser, **pure browser-based YouTube downloading is not practical** due to:
+
+1. **Encrypted Video Streams** - YouTube uses signed URLs with `signatureCipher` that expire quickly. These require real-time signature decryption which is not possible in pure WASM.
+
+2. **CORS Restrictions** - Browsers enforce Cross-Origin Resource Sharing (CORS) policies. YouTube's video CDN doesn't allow direct browser requests.
+
+3. **Video+Audio Merging** - Most HD videos (720p+) have separate video and audio streams that need to be merged. This requires FFmpeg or similar tools that can't run in the browser.
+
+4. **DRM and Encryption** - Many videos are encrypted or have DRM protection that prevents direct access.
+
+### Solution
+
+The current architecture uses:
+- **WASM** for fast URL parsing and validation (client-side)
+- **yt-dlp** (Python) for video extraction with signature decryption
+- **Server-side streaming** for memory-efficient S3 upload
+
+This hybrid approach provides reliability while keeping the browser responsive.
+
 ## Prerequisites
 
 - Python 3.10+
