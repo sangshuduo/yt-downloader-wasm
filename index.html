@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube Video Downloader</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 700px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+        h1 { text-align: center; color: #333; margin-bottom: 10px; }
+        .wasm-badge {
+            display: block;
+            text-align: center;
+            background: #ff6b6b;
+            color: white;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            width: fit-content;
+            margin: 0 auto 10px;
+        }
+        .subtitle { text-align: center; color: #666; margin-bottom: 30px; }
+        .input-group { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+        input[type="text"] {
+            flex: 1; min-width: 250px; padding: 15px;
+            border: 2px solid #e0e0e0; border-radius: 10px;
+            font-size: 16px; outline: none; transition: border-color 0.3s;
+        }
+        input[type="text"]:focus { border-color: #667eea; }
+        button {
+            padding: 15px 30px; background: #667eea; color: white;
+            border: none; border-radius: 10px; font-size: 16px;
+            cursor: pointer; transition: background 0.3s;
+        }
+        button:hover { background: #5568d3; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        button.upload-s3 {
+            background: #28a745;
+        }
+        button.upload-s3:hover {
+            background: #218838;
+        }
+        .result {
+            margin-top: 20px; padding: 20px; border-radius: 10px; display: none;
+        }
+        .result.success { display: block; background: #d4edda; border: 1px solid #c3e6cb; }
+        .result.error { display: block; background: #f8d7da; border: 1px solid #f5c6cb; }
+        .result.loading { display: block; background: #fff3cd; border: 1px solid #ffeaa7; text-align: center; }
+        .result.uploading { display: block; background: #cce5ff; border: 1px solid #b8daff; text-align: center; }
+        .result.done { display: block; background: #d4edda; border: 1px solid #c3e6cb; text-align: center; }
+        .video-info { margin-top: 15px; padding-top: 15px; border-top: 1px solid rgba(0,0,0,0.1); }
+        .video-title { font-weight: bold; color: #333; margin-bottom: 10px; word-break: break-word; }
+        .formats { margin-top: 15px; display: flex; flex-wrap: wrap; gap: 10px; }
+        .format-btn {
+            padding: 10px 20px; background: #17a2b8; border: none;
+            border-radius: 5px; color: white; cursor: pointer; font-size: 14px;
+        }
+        .format-btn:hover { background: #138496; }
+        input[type="radio"]:checked + span {
+            font-weight: bold;
+            color: #667eea;
+        }
+        .radio-label {
+            display: block;
+            padding: 12px 15px;
+            margin: 8px 0;
+            background: white;
+            border-radius: 8px;
+            cursor: pointer;
+            border: 2px solid #e0e0e0;
+            transition: all 0.2s;
+        }
+        .radio-label:hover {
+            border-color: #667eea;
+            background: #f8f9ff;
+        }
+        .radio-label:has(input:checked) {
+            border-color: #667eea;
+            background: #e8eeff;
+        }
+        .s3-url {
+            margin-top: 15px;
+            padding: 15px;
+            background: white;
+            border-radius: 8px;
+            word-break: break-all;
+            font-family: monospace;
+            font-size: 13px;
+        }
+        .copy-btn {
+            margin-top: 10px;
+            padding: 8px 16px;
+            background: #6c757d;
+            font-size: 14px;
+        }
+        .spinner {
+            border: 3px solid #f3f3f3; border-top: 3px solid #667eea;
+            border-radius: 50%; width: 30px; height: 30px;
+            animation: spin 1s linear infinite; margin: 0 auto;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>YouTube Downloader</h1>
+        <span class="wasm-badge">Upload to AWS S3</span>
+        <p class="subtitle">Download YouTube videos and upload to S3 bucket</p>
+        
+        <div class="input-group">
+            <input type="text" id="urlInput" placeholder="Paste YouTube URL here..." />
+            <button id="downloadBtn">Get Video</button>
+        </div>
+
+        <div id="result" class="result"></div>
+    </div>
+
+    <script type="module">
+        import init, { validate_youtube_url, extract_video_id } from './pkg/yt_downloader_wasm.js';
+
+        const urlInput = document.getElementById('urlInput');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const resultDiv = document.getElementById('result');
+        let wasmLoaded = false;
+        let currentYouTubeUrl = '';
+        let currentTitle = '';
+
+        async function loadWasm() {
+            try {
+                await init();
+                wasmLoaded = true;
+                console.log('WASM loaded');
+            } catch (error) {
+                console.error('WASM error:', error);
+            }
+        }
+        loadWasm();
+
+        function extractVideoIdFromUrl(url) {
+            if (wasmLoaded) {
+                const result = extract_video_id(url);
+                return result || null;
+            }
+            const patterns = [
+                /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)/,
+                /youtube\.com\/shorts\/([^&\n?#]+)/
+            ];
+            for (const pattern of patterns) {
+                const match = url.match(pattern);
+                if (match) return match[1];
+            }
+            return null;
+        }
+
+        async function getVideoInfo(videoId) {
+            currentYouTubeUrl = `https://youtube.com/watch?v=${videoId}`;
+            const response = await fetch(`/api/video?url=${encodeURIComponent(currentYouTubeUrl)}`);
+            const data = await response.json();
+            
+            if (data.error) {
+                throw new Error(data.error);
+            }
+            
+            currentTitle = data.title;
+            return data;
+        }
+
+        async function uploadToS3() {
+            if (!currentYouTubeUrl || !currentTitle) {
+                showError('No video selected');
+                return;
+            }
+
+            // Get selected quality
+            const selectedRadio = document.querySelector('input[name="quality"]:checked');
+            const selectedQuality = selectedRadio ? selectedRadio.value : 'best';
+
+            resultDiv.className = 'result uploading';
+            resultDiv.innerHTML = `
+                <div class="spinner"></div>
+                <p style="margin-top:15px">Downloading ${selectedQuality} and uploading to S3...</p>
+                <p style="margin-top:10px;font-size:14px;color:#666">This may take a few minutes depending on video size</p>
+            `;
+
+            try {
+                const response = await fetch('/api/upload-s3', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        url: currentYouTubeUrl,
+                        title: currentTitle,
+                        quality: selectedQuality
+                    })
+                });
+
+                const data = await response.json();
+
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+
+                // Show success with S3 URL
+                resultDiv.className = 'result done';
+                resultDiv.innerHTML = `
+                    <strong>✅ Upload Complete!</strong>
+                    <div class="video-info">
+                        <div class="video-title">${currentTitle}</div>
+                        <div class="s3-url">
+                            <strong>S3 URL:</strong><br>
+                            <a href="${data.s3_url}" target="_blank" style="color:#007bff">${data.s3_url}</a>
+                        </div>
+                        <button class="format-btn copy-btn" onclick="copyToClipboard('${data.s3_url}')">Copy URL</button>
+                    </div>
+                `;
+
+            } catch (error) {
+                showError('Upload failed: ' + error.message);
+            }
+        }
+
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).then(() => {
+                alert('URL copied to clipboard!');
+            }).catch(err => {
+                console.error('Failed to copy:', err);
+            });
+        }
+
+        async function downloadVideo() {
+            const url = urlInput.value.trim();
+            if (!url) {
+                showError('Please enter a YouTube URL');
+                return;
+            }
+
+            const videoId = extractVideoIdFromUrl(url);
+            if (!videoId) {
+                showError('Invalid YouTube URL');
+                return;
+            }
+
+            downloadBtn.disabled = true;
+            showLoading();
+
+            try {
+                const { title, formats } = await getVideoInfo(videoId);
+                if (!formats || formats.length === 0) {
+                    showError('No downloadable formats found');
+                    return;
+                }
+                showSuccess(title, formats);
+            } catch (error) {
+                showError(error.message);
+            } finally {
+                downloadBtn.disabled = false;
+            }
+        }
+
+        function showLoading() {
+            resultDiv.className = 'result loading';
+            resultDiv.innerHTML = '<div class="spinner"></div><p style="margin-top:15px">Fetching video info...</p>';
+        }
+
+        function showError(message) {
+            resultDiv.className = 'result error';
+            resultDiv.innerHTML = `<strong>Error:</strong> ${message}`;
+        }
+
+        function showSuccess(title, formats) {
+            resultDiv.className = 'result success';
+            
+            // Remove duplicates and create radio options
+            const uniqueQualities = [];
+            const seen = new Set();
+            for (const f of formats) {
+                const q = f.quality || 'Unknown';
+                if (!seen.has(q)) {
+                    seen.add(q);
+                    uniqueQualities.push(f);
+                }
+            }
+            
+            let radioButtons = uniqueQualities.map((f, i) => `
+                <label class="radio-label">
+                    <input type="radio" name="quality" value="${f.quality || 'best'}" ${i === 0 ? 'checked' : ''}>
+                    <span style="margin-left:10px">${f.quality || 'Best Quality'}</span>
+                </label>
+            `).join('');
+
+            resultDiv.innerHTML = `
+                <strong>Video Found!</strong>
+                <div class="video-info">
+                    <div class="video-title">${title}</div>
+                    <p>Select quality:</p>
+                    <div class="formats">${radioButtons}</div>
+                    <button class="format-btn upload-s3" id="uploadS3Btn" style="margin-top:15px;width:100%">
+                        🚀 Upload to S3 Bucket
+                    </button>
+                </div>
+            `;
+
+            document.getElementById('uploadS3Btn').addEventListener('click', uploadToS3);
+        }
+
+        downloadBtn.addEventListener('click', downloadVideo);
+        urlInput.addEventListener('keypress', e => { if (e.key === 'Enter') downloadVideo(); });
+    </script>
+</body>
+</html>
