@@ -1,0 +1,71 @@
+version: "3"
+
+services:
+  invidious:
+    image: quay.io/invidious/invidious:latest
+    platform: linux/amd64
+    container_name: invidious
+    ports:
+      - "3000:3000"
+    environment:
+      INVIDIOUS_CONFIG: |
+        db:
+          dbname: invidious
+          user: kemal
+          password: kemal
+          host: invidious-db
+          port: 5432
+        check_tables: true
+        invidious_companion:
+        - private_url: "http://companion:8282/companion"
+        invidious_companion_key: "81bf41433d3a30ac"
+        hmac_key: "MIV1xNKgdSVOhuL6qx9X"
+    healthcheck:
+      test: wget -nv --tries=1 --spider http://127.0.0.1:3000/api/v1/stats || exit 1
+      interval: 30s
+      timeout: 5s
+      retries: 2
+    logging:
+      options:
+        max-size: "1G"
+        max-file: "4"
+    restart: unless-stopped
+    depends_on:
+      invidious-db:
+        condition: service_healthy
+
+  companion:
+    image: quay.io/invidious/invidious-companion:latest
+    platform: linux/amd64
+    container_name: invidious-companion
+    environment:
+      - SERVER_SECRET_KEY=81bf41433d3a30ac
+    restart: unless-stopped
+    logging:
+      options:
+        max-size: "1G"
+        max-file: "4"
+    cap_drop:
+      - ALL
+    read_only: true
+    volumes:
+      - companioncache:/var/tmp/youtubei.js:rw
+    security_opt:
+      - no-new-privileges:true
+
+  invidious-db:
+    image: docker.io/library/postgres:14
+    container_name: invidious-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: invidious
+      POSTGRES_USER: kemal
+      POSTGRES_PASSWORD: kemal
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+
+volumes:
+  postgres-data:
+  companioncache:
