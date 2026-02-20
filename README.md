@@ -1,6 +1,6 @@
-# YouTube Video Downloader (WASM + Python + Invidious)
+# YouTube Video Downloader (WASM + Python + Invidious/Piped)
 
-A web-based YouTube video downloader that runs in the browser and uploads directly to AWS S3. Built with Rust WASM for URL validation, Invidious for video extraction (with yt-dlp as backup), and Python Flask.
+A web-based YouTube video downloader that runs in the browser and uploads directly to AWS S3. Built with Rust WASM for URL validation, three backend options (yt-dlp, Invidious, Piped) for video extraction, and Python Flask.
 
 ## Architecture
 
@@ -34,9 +34,10 @@ A web-based YouTube video downloader that runs in the browser and uploads direct
 │  │                             │                       │               │  │
 │  │                             ▼                       ▼               │  │
 │  │                    ┌──────────────┐  ┌────────────────────────────┐ │  │
-│  │                    │ Invidious or │  │  Video Download + S3 Upload │ │  │
-│  │                    │   yt-dlp     │  │  (Download & Upload)       │ │  │
-│  │                    │  (Extract)   │  │                            │ │  │
+│  │                    │ Invidious, │  │  Video Download + S3 Upload │ │  │
+│  │                    │ Piped, or  │  │  (Download & Upload)       │ │  │
+│  │                    │   yt-dlp   │  │                            │ │  │
+│  │                    │ (Extract)  │  │                            │ │  │
 │  │                    └──────────────┘  └────────────────────────────┘ │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────┬───────────────────────────────────────┘
@@ -44,8 +45,8 @@ A web-based YouTube video downloader that runs in the browser and uploads direct
               ┌───────────────────┼───────────────────┐
               ▼                   ▼                   ▼
     ┌─────────────────┐  ┌─────────────┐  ┌──────────────────┐
-    │   YouTube       │  │  Invidious  │  │    AWS S3        │
-    │   (Source)      │  │  (Local)    │  │  huski-tmp-new   │
+    │   YouTube       │  │ Invidious / │  │    AWS S3        │
+    │   (Source)      │  │   Piped     │  │  huski-tmp-new   │
     └─────────────────┘  └─────────────┘  └──────────────────┘
 ```
 
@@ -55,7 +56,7 @@ A web-based YouTube video downloader that runs in the browser and uploads direct
 |-----------|------------|-------------|
 | Frontend UI | HTML/CSS/JS | Browser-based user interface |
 | URL Validation | Rust WASM | Fast URL parsing and video ID extraction |
-| Video Processing | Invidious / yt-dlp | YouTube video metadata extraction (configurable) |
+| Video Processing | yt-dlp / Invidious / Piped | YouTube video metadata extraction (configurable) |
 | Backend Server | Python Flask | REST API for video operations |
 | Cloud Storage | AWS S3 | Video file storage |
 | WSGI Server | gunicorn | Production-grade server (Linux only) |
@@ -68,7 +69,7 @@ A web-based YouTube video downloader that runs in the browser and uploads direct
 - 📦 **MP4 Format** - Automatically selects MP4 format
 - 🚀 **Concurrent Downloads** - Support for multiple simultaneous downloads
 - ⚡ **WASM Powered** - Fast URL validation using WebAssembly
-- 🔄 **Dual Backend** - Use yt-dlp (default) or Invidious with local proxy
+- 🔄 **Triple Backend** - Use yt-dlp (default), Invidious, or Piped for video extraction
 
 ## Why Server-Side Processing?
 
@@ -89,6 +90,7 @@ While the project uses WebAssembly (WASM) for URL validation in the browser, **p
 The current architecture uses:
 - **WASM** for fast URL parsing and validation (client-side)
 - **Invidious** (with companion) for video extraction via local proxy, hiding your IP from YouTube
+- **Piped** for video extraction via self-hosted or public instances, with random instance selection and retry
 - **yt-dlp** (Python) as default/fallback for video extraction with signature decryption
 - **Server-side streaming** for memory-efficient S3 upload
 
@@ -98,7 +100,7 @@ This hybrid approach provides reliability while keeping the browser responsive.
 
 - Python 3.10+
 - Node.js (for WASM compilation)
-- Docker & Docker Compose (for self-hosted Invidious)
+- Docker & Docker Compose (for self-hosted Invidious and/or Piped)
 - AWS credentials with S3 upload permissions
 - Virtual environment (recommended)
 
@@ -186,7 +188,7 @@ Gets available video formats.
 
 **Parameters:**
 - `url` (required) - YouTube video URL
-- `backend` (optional) - `yt-dlp` (default) or `invidious`
+- `backend` (optional) - `yt-dlp` (default), `invidious`, or `piped`
 
 **Response:**
 ```json
@@ -248,16 +250,24 @@ S3_REGION = "us-east-1"
 
 ### Backend Selection
 
-The server supports two backends:
-- **yt-dlp** (default) - Uses yt-dlp directly, most reliable
-- **Invidious** - Uses local Invidious instance with companion for video proxy, hides your server IP from YouTube
+The server supports three backends:
+- **yt-dlp** (default) - Uses yt-dlp directly on the host machine, most reliable
+- **Invidious** - Uses local Invidious instance (Docker) with companion for video proxy, hides your server IP from YouTube
+- **Piped** - Uses self-hosted or public Piped instances (Docker or remote), with random instance selection and automatic retry
 
 **Environment Variables:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DEFAULT_BACKEND` | `yt-dlp` | Default backend: `yt-dlp` or `invidious` |
+| `DEFAULT_BACKEND` | `yt-dlp` | Default backend: `yt-dlp`, `invidious`, or `piped` |
 | `INVIDIOUS_URL` | `http://localhost:3000` | Invidious instance URL |
+| `PIPED_API_URL` | _(empty)_ | Self-hosted Piped API URL. When set, auto-selects `piped` as default backend and disables public instance fallback |
+| `PIPED_INSTANCES` | _(built-in list)_ | Comma-separated list of public Piped API URLs to override the built-in list |
+| `PIPED_MAX_ATTEMPTS` | `8` | Max number of public Piped instances to try before giving up |
+
+**Default backend auto-detection:** If `DEFAULT_BACKEND` is not set, the server auto-detects based on environment:
+1. If `PIPED_API_URL` is set → defaults to `piped`
+2. Otherwise → defaults to `yt-dlp`
 
 **Examples:**
 
@@ -268,17 +278,28 @@ python server.py
 # Use Invidious as default (requires local Invidious running)
 DEFAULT_BACKEND=invidious python server.py
 
-# Use custom Invidious instance
-INVIDIOUS_URL=http://your-vps-ip:3000 DEFAULT_BACKEND=invidious python server.py
+# Use custom Invidious instance with custom port
+INVIDIOUS_URL=http://your-vps-ip:4000 DEFAULT_BACKEND=invidious python server.py
+
+# Use self-hosted Piped (auto-detects piped as default)
+PIPED_API_URL=http://localhost:8081 python server.py
+
+# Use self-hosted Piped with custom port
+PIPED_API_URL=http://localhost:9090 python server.py
+
+# Use Piped public instances (no self-hosted)
+DEFAULT_BACKEND=piped python server.py
 ```
 
 **Per-Request Override:**
 
-You can override the backend for each request:
+You can override the backend for each request via the UI radio buttons or API parameter:
 
 ```bash
-# Get video info using yt-dlp
+# Get video info using a specific backend
 curl "http://localhost:8080/api/video?url=...&backend=yt-dlp"
+curl "http://localhost:8080/api/video?url=...&backend=invidious"
+curl "http://localhost:8080/api/video?url=...&backend=piped"
 ```
 
 ### Server Port
@@ -333,13 +354,32 @@ docker compose up -d
 curl http://localhost:3000/api/v1/stats
 ```
 
+### Port Configuration
+
+To change the Invidious port, update both `docker-compose.yml` and the environment variable:
+
+1. In `docker-compose.yml`, change the host port (left side):
+   ```yaml
+   invidious:
+     ports:
+       - "4000:3000"  # Change 3000 to your desired port
+   ```
+
+2. Launch server.py with the matching URL:
+   ```bash
+   INVIDIOUS_URL=http://localhost:4000 DEFAULT_BACKEND=invidious python server.py
+   ```
+
 ### Using with Downloader
 
 After Invidious is running:
 
 ```bash
-# Local Invidious
+# Local Invidious (default port 3000)
 DEFAULT_BACKEND=invidious python server.py
+
+# Custom port
+INVIDIOUS_URL=http://localhost:4000 DEFAULT_BACKEND=invidious python server.py
 
 # Remote Invidious (VPS)
 INVIDIOUS_URL=http://your-vps-ip:3000 DEFAULT_BACKEND=invidious python server.py
@@ -351,6 +391,67 @@ INVIDIOUS_URL=http://your-vps-ip:3000 DEFAULT_BACKEND=invidious python server.py
 docker compose down       # Stop
 docker compose up -d      # Start
 docker compose logs -f    # View logs
+```
+
+## Self-Hosted Piped
+
+The `docker-compose.yml` also includes Piped services under the `piped` profile. A self-hosted Piped instance provides more reliable video extraction than public instances.
+
+### Architecture
+
+The Piped stack consists of four services:
+- **Piped Backend** - Java-based API server using NewPipeExtractor (port 8081 → 8080)
+- **Piped Proxy** - Proxies video streams from YouTube CDN (port 8082 → 8080)
+- **BG Helper** - Generates PoTokens to bypass YouTube bot detection
+- **PostgreSQL** - Database for Piped metadata
+
+### Quick Start
+
+1. Start Piped services (uses the `piped` Docker Compose profile):
+
+```bash
+docker compose --profile piped up -d
+```
+
+2. Wait for database initialization and backend startup (~30 seconds), then verify:
+
+```bash
+curl http://localhost:8081/streams/dQw4w9WgXcQ | python3 -m json.tool | head -5
+```
+
+3. Run the downloader with Piped as default:
+
+```bash
+PIPED_API_URL=http://localhost:8081 python server.py
+```
+
+### Port Configuration
+
+To change the Piped backend port, update both `docker-compose.yml` and the environment variable:
+
+1. In `docker-compose.yml`, change the host port (left side):
+   ```yaml
+   piped:
+     ports:
+       - "9090:8080"  # Change 8081 to your desired port
+   ```
+
+2. Launch server.py with the matching URL:
+   ```bash
+   PIPED_API_URL=http://localhost:9090 python server.py
+   ```
+
+### Known Issues
+
+- **"The page needs to be reloaded" error**: The official Piped image may lack PoToken support. The docker-compose.yml uses the community-fixed image `nieveve/piped-backend:latest` which resolves this. See [TeamPiped/Piped#4139](https://github.com/TeamPiped/Piped/issues/4139).
+- **Public Piped instances**: Most public instances are unreliable due to YouTube's anti-bot measures. Self-hosting is recommended.
+
+### Stop/Start
+
+```bash
+docker compose --profile piped down       # Stop Piped services
+docker compose --profile piped up -d      # Start Piped services
+docker compose --profile piped logs -f    # View Piped logs
 ```
 
 ### Concurrent Downloads
@@ -369,7 +470,8 @@ timeout = 600        # Request timeout (seconds)
 yt_downloader_wasm/
 ├── index.html           # Web UI
 ├── server.py            # Flask server
-├── docker-compose.yml   # Invidious + Companion + PostgreSQL
+├── docker-compose.yml       # Invidious + Piped + PostgreSQL services
+├── piped-config.properties  # Piped backend configuration
 ├── requirements.txt     # Python dependencies
 ├── gunicorn_config.py   # Gunicorn configuration
 ├── Cargo.toml           # Rust project config
@@ -393,6 +495,18 @@ yt_downloader_wasm/
 - Verify companion connectivity: `docker compose logs invidious-companion`
 - Ensure `invidious_companion_key` matches `SERVER_SECRET_KEY`
 - Fallback to yt-dlp: `DEFAULT_BACKEND=yt-dlp python server.py`
+- Or try Piped: `DEFAULT_BACKEND=piped python server.py`
+
+### Piped "The page needs to be reloaded"
+- This is a known upstream issue with YouTube bot detection ([TeamPiped/Piped#4139](https://github.com/TeamPiped/Piped/issues/4139))
+- Ensure `docker-compose.yml` uses the community-fixed image: `nieveve/piped-backend:latest`
+- Check that the BG Helper service is running: `docker compose --profile piped ps`
+- Check Piped logs: `docker compose --profile piped logs piped`
+
+### Piped public instances all failing
+- Most public Piped instances are unreliable due to YouTube anti-bot measures
+- Self-host Piped for reliability: `docker compose --profile piped up -d`
+- Increase retry attempts: `PIPED_MAX_ATTEMPTS=15 python server.py`
 
 ### "Could not find downloadable formats"
 - Video may be age-restricted or unavailable

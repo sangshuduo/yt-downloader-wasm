@@ -109,6 +109,32 @@
             background: #6c757d;
             font-size: 14px;
         }
+        .backend-selector {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+            justify-content: center;
+        }
+        .backend-selector label {
+            padding: 8px 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        .backend-selector label:hover {
+            border-color: #667eea;
+            background: #f8f9ff;
+        }
+        .backend-selector input[type="radio"] { display: none; }
+        .backend-selector input[type="radio"]:checked + span {
+            font-weight: bold;
+        }
+        .backend-selector label:has(input:checked) {
+            border-color: #667eea;
+            background: #e8eeff;
+        }
         .spinner {
             border: 3px solid #f3f3f3; border-top: 3px solid #667eea;
             border-radius: 50%; width: 30px; height: 30px;
@@ -116,6 +142,7 @@
         }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     </style>
+    <!--SERVER_CONFIG-->
 </head>
 <body>
     <div class="container">
@@ -123,6 +150,12 @@
         <span class="wasm-badge">Upload to AWS S3</span>
         <p class="subtitle">Download YouTube videos and upload to S3 bucket</p>
         
+        <div class="backend-selector">
+            <label><input type="radio" name="backend" value="yt-dlp" checked><span>yt-dlp</span></label>
+            <label><input type="radio" name="backend" value="invidious"><span>Invidious</span></label>
+            <label><input type="radio" name="backend" value="piped"><span>Piped</span></label>
+        </div>
+
         <div class="input-group">
             <input type="text" id="urlInput" placeholder="Paste YouTube URL here..." />
             <button id="downloadBtn">Get Video</button>
@@ -140,7 +173,11 @@
         let wasmLoaded = false;
         let currentYouTubeUrl = '';
         let currentTitle = '';
-        let currentBackend = 'yt-dlp';
+        let currentBackend = window.DEFAULT_BACKEND || 'yt-dlp';
+
+        // Set the backend radio button to match server default
+        const defaultRadio = document.querySelector(`input[name="backend"][value="${currentBackend}"]`);
+        if (defaultRadio) defaultRadio.checked = true;
 
         async function loadWasm() {
             try {
@@ -180,9 +217,15 @@
             return null;
         }
 
+        function getSelectedBackend() {
+            const selected = document.querySelector('input[name="backend"]:checked');
+            return selected ? selected.value : 'yt-dlp';
+        }
+
         async function getVideoInfo(videoId) {
             currentYouTubeUrl = `https://youtube.com/watch?v=${videoId}`;
-            const response = await fetch(`/api/video?url=${encodeURIComponent(currentYouTubeUrl)}`);
+            const backend = getSelectedBackend();
+            const response = await fetch(`/api/video?url=${encodeURIComponent(currentYouTubeUrl)}&backend=${backend}`);
             const data = await response.json();
             
             if (data.error) {
@@ -278,7 +321,7 @@
                     showError('No downloadable formats found');
                     return;
                 }
-                currentBackend = backend || 'invidious';
+                currentBackend = backend || getSelectedBackend();
                 showSuccess(title, formats, duration, currentBackend);
             } catch (error) {
                 showError(error.message);
@@ -340,7 +383,7 @@
                 <div class="video-info">
                     <div class="video-title">${title}</div>
                     ${formattedDuration ? `<p>Duration: ${formattedDuration}</p>` : ''}
-                    <p>Backend: <strong>${backend || 'invidious'}</strong></p>
+                    <p>Backend: <strong>${backend || 'yt-dlp'}</strong></p>
                     <p>Select quality:</p>
                     <div class="formats">${radioButtons}</div>
                     <button class="format-btn upload-s3" id="uploadS3Btn" style="margin-top:15px;width:100%">
