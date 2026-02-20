@@ -17,6 +17,7 @@ from datetime import datetime
 import time
 import requests
 import re
+import random
 
 
 # Increase Flask request timeout
@@ -32,8 +33,74 @@ class TimeoutMiddleware:
 app = Flask(__name__)
 
 # Backend Configuration
-DEFAULT_BACKEND = os.getenv("DEFAULT_BACKEND", "yt-dlp")
 INVIDIOUS_URL = os.getenv("INVIDIOUS_URL", "http://localhost:3000")
+# Auto-detect default backend from env: explicit > PIPED_API_URL > yt-dlp
+if os.getenv("DEFAULT_BACKEND"):
+    DEFAULT_BACKEND = os.getenv("DEFAULT_BACKEND")
+elif os.getenv("PIPED_API_URL"):
+    DEFAULT_BACKEND = "piped"
+else:
+    DEFAULT_BACKEND = "yt-dlp"
+
+# Piped public API instances (randomly selected, with retry fallback)
+# Full list from https://github.com/TeamPiped/documentation and community sources
+PIPED_INSTANCES = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi-libre.kavin.rocks",
+    "https://pipedapi.leptons.xyz",
+    "https://pipedapi.r4fo.com",
+    "https://api-piped.mha.fi",
+    "https://piped-api.garudalinux.org",
+    "https://pipedapi.rivo.lol",
+    "https://piped-api.lunar.icu",
+    "https://ytapi.dc09.ru",
+    "https://pipedapi.colinslegacy.com",
+    "https://yapi.vyper.me",
+    "https://api.looleh.xyz",
+    "https://piped-api.cfe.re",
+    "https://pa.mint.lgbt",
+    "https://pa.il.ax",
+    "https://api.piped.projectsegfau.lt",
+    "https://watchapi.whatever.social",
+    "https://api.piped.privacydev.net",
+    "https://pipedapi.palveluntarjoaja.eu",
+    "https://pipedapi.smnz.de",
+    "https://pipedapi.qdi.fi",
+    "https://piped-api.hostux.net",
+    "https://pdapi.vern.cc",
+    "https://pipedapi.pfcd.me",
+    "https://pipedapi.frontendfriendly.xyz",
+    "https://api.piped.yt",
+    "https://pipedapi.astartes.nl",
+    "https://pipedapi.osphost.fi",
+    "https://pipedapi.simpleprivacy.fr",
+    "https://pipedapi.drgns.space",
+    "https://piapi.ggtyler.dev",
+    "https://api.watch.pluto.lat",
+    "https://piped-backend.seitan-ayoub.lol",
+    "https://api.piped.minionflo.net",
+    "https://pipedapi.nezumi.party",
+    "https://pipedapi.ducks.party",
+    "https://pipedapi.ngn.tf",
+    "https://piped-api.codespace.cz",
+    "https://pipedapi.reallyaweso.me",
+    "https://pipedapi.phoenixthrush.com",
+    "https://api.piped.private.coffee",
+    "https://schaunapi.ehwurscht.at",
+    "https://pipedapi.darkness.services",
+    "https://pipedapi.andreafortuna.org",
+    "https://pipedapi.orangenet.cc",
+    "https://pipedapi.owo.si",
+    "https://pipedapi.nosebs.ru",
+    "https://piped-api.privacy.com.de",
+    "https://pipedapi.coldforge.xyz",
+    "https://piped.wireway.ch",
+]
+# Allow overriding with a custom instance list via env var (comma-separated)
+if os.getenv("PIPED_INSTANCES"):
+    PIPED_INSTANCES = [u.strip() for u in os.getenv("PIPED_INSTANCES").split(",")]
+# Self-hosted Piped instance URL (used when running Piped via Docker Compose)
+PIPED_SELF_HOSTED_URL = os.getenv("PIPED_API_URL", "")
 
 # S3 Configuration
 S3_BUCKET = os.getenv("S3_BUCKET", "huski-tmp-new")
@@ -118,6 +185,146 @@ def get_video_info_invidious(video_id):
         raise Exception(f"Invidious error: {str(e)}")
 
 
+def _parse_piped_streams(data):
+    """Parse videoStreams from a Piped API response into our format list.
+
+    Prefers combined (audio+video) streams, then supplements with video-only
+    streams for higher quality options not available as combined.
+    """
+    combined = []
+    video_only = []
+
+    for fmt in data.get("videoStreams", []):
+        if not fmt.get("url"):
+            continue
+        height = fmt.get("height", 0)
+        quality = fmt.get("quality", "")
+        # Some streams (e.g. combined 360p) have height=0; parse from quality string
+        if not height and quality:
+            match = re.match(r"(\d+)p", quality)
+            if match:
+                height = int(match.group(1))
+        if height <= 0:
+            continue
+        entry = {
+            "quality": quality or f"{height}p",
+            "url": fmt["url"],
+            "itag": str(fmt.get("itag", "")),
+            "ext": "mp4",
+            "height": height,
+        }
+        if fmt.get("videoOnly", True):
+            video_only.append(entry)
+        else:
+            combined.append(entry)
+
+    # Start with combined streams, then add video-only for heights not covered
+    formats = list(combined)
+    combined_heights = {f["height"] for f in combined}
+    for fmt in video_only:
+        if fmt["height"] not in combined_heights:
+            formats.append(fmt)
+
+    # Deduplicate by height
+    seen_heights = set()
+    unique_formats = []
+    for fmt in formats:
+        if fmt["height"] not in seen_heights:
+            seen_heights.add(fmt["height"])
+            unique_formats.append(fmt)
+    formats = unique_formats
+
+    formats.sort(key=lambda x: x["height"], reverse=True)
+    return formats
+
+
+def _try_piped_instance(instance_url, video_id):
+    """Try a single Piped instance. Returns result dict or raises on failure."""
+    api_url = f"{instance_url}/streams/{video_id}"
+    print(f"Trying Piped instance: {api_url}", file=sys.stderr)
+
+    response = requests.get(api_url, timeout=10, allow_redirects=False)
+
+    # Reject redirects (often means the instance is misconfigured)
+    if response.is_redirect or response.status_code in (301, 302, 307, 308):
+        raise Exception(f"Redirected (HTTP {response.status_code})")
+
+    # Try to parse JSON even on error status codes (Piped returns JSON errors)
+    try:
+        data = response.json()
+    except Exception:
+        response.raise_for_status()
+        raise Exception(f"Non-JSON response (HTTP {response.status_code})")
+
+    if data.get("error"):
+        error_msg = str(data.get("message", data["error"]))[:150]
+        raise Exception(f"API error: {error_msg}")
+
+    if response.status_code >= 400:
+        raise Exception(f"HTTP {response.status_code}")
+
+    if not data.get("title"):
+        raise Exception("Empty response (no title)")
+
+    formats = _parse_piped_streams(data)
+
+    print(
+        f"Piped instance {instance_url} returned {len(formats)} formats",
+        file=sys.stderr,
+    )
+
+    return {
+        "title": data.get("title", "YouTube Video"),
+        "thumbnail": data.get("thumbnailUrl"),
+        "duration": data.get("duration", 0),
+        "formats": formats[:10],
+        "videoId": video_id,
+        "piped_instance": instance_url,
+    }
+
+
+# Max public instances to try before giving up (avoids very long waits)
+PIPED_MAX_ATTEMPTS = int(os.getenv("PIPED_MAX_ATTEMPTS", "8"))
+
+
+def get_video_info_piped(video_id):
+    """Get video info from Piped API with random instance selection and retry."""
+    last_error = None
+
+    # If a self-hosted instance is configured, use only that
+    if PIPED_SELF_HOSTED_URL:
+        return _try_piped_instance(PIPED_SELF_HOSTED_URL, video_id)
+
+    # Otherwise, try random public instances
+    instances = list(PIPED_INSTANCES)
+    random.shuffle(instances)
+    tried = 0
+
+    for instance_url in instances:
+        if tried >= PIPED_MAX_ATTEMPTS:
+            print(
+                f"Piped: reached max attempts ({PIPED_MAX_ATTEMPTS}), stopping",
+                file=sys.stderr,
+            )
+            break
+        tried += 1
+
+        try:
+            return _try_piped_instance(instance_url, video_id)
+        except requests.exceptions.RequestException as e:
+            print(f"Piped instance {instance_url} failed: {e}", file=sys.stderr)
+            last_error = str(e)
+            continue
+        except Exception as e:
+            print(f"Piped instance {instance_url} error: {e}", file=sys.stderr)
+            last_error = str(e)
+            continue
+
+    raise Exception(
+        f"All Piped instances failed (tried {tried}). Last error: {last_error}"
+    )
+
+
 # Initialize S3 client - reads from ~/.aws/credentials by default
 s3_client = boto3.client(
     "s3",
@@ -130,9 +337,14 @@ active_uploads = {}
 
 @app.route("/")
 def index():
-    """Serve the main page."""
+    """Serve the main page with default backend injected."""
     with open("index.html", "r") as f:
-        return f.read()
+        html = f.read()
+    html = html.replace(
+        "<!--SERVER_CONFIG-->",
+        f"<script>window.DEFAULT_BACKEND = '{DEFAULT_BACKEND}';</script>",
+    )
+    return html
 
 
 @app.route("/pkg/<path:filename>")
@@ -166,6 +378,14 @@ def get_video():
             return jsonify(info)
         except Exception as e:
             return jsonify({"error": str(e), "backend": "invidious"}), 500
+
+    if backend == "piped" and video_id:
+        try:
+            info = get_video_info_piped(video_id)
+            info["backend"] = "piped"
+            return jsonify(info)
+        except Exception as e:
+            return jsonify({"error": str(e), "backend": "piped"}), 500
 
     # Default: use yt-dlp
     ydl_opts = {
@@ -253,14 +473,16 @@ def upload_to_s3():
     temp_filename = f"{temp_dir}/yt_{unique_id}.mp4"
 
     try:
-        if backend == "invidious":
-            # Invidious path
+        if backend in ("invidious", "piped"):
             video_id = extract_video_id(video_url)
             if not video_id:
                 raise Exception("Could not extract video ID from URL")
 
-            # Get video info from Invidious to find the best quality URL
-            info = get_video_info_invidious(video_id)
+            # Get video info from the selected backend
+            if backend == "piped":
+                info = get_video_info_piped(video_id)
+            else:
+                info = get_video_info_invidious(video_id)
 
             # Select format based on quality
             selected_format = None
@@ -282,9 +504,9 @@ def upload_to_s3():
                 raise Exception("No suitable format found")
 
             direct_url = selected_format["url"]
-            print(f"Downloading from Invidious: {direct_url[:80]}...", file=sys.stderr)
+            print(f"Downloading from {backend}: {direct_url[:80]}...", file=sys.stderr)
 
-            # Download video from Invidious URL
+            # Download video from direct URL
             req = urllib.request.Request(direct_url)
             req.add_header("User-Agent", "Mozilla/5.0")
             req.add_header("Accept", "*/*")
@@ -426,6 +648,7 @@ if __name__ == "__main__":
     print("Starting YouTube Downloader Server...")
     print(f"Default backend: {DEFAULT_BACKEND}")
     print(f"Invidious URL: {INVIDIOUS_URL}")
+    print(f"Piped instances: {len(PIPED_INSTANCES)} configured")
     print(f"Uploading to S3 bucket: {S3_BUCKET}")
     print("Open http://localhost:8080 in your browser")
     print("Multiple concurrent downloads: ENABLED")

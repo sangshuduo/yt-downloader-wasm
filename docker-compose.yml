@@ -66,6 +66,60 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
 
+  # --- Piped Backend (alternative to Invidious) ---
+  # Start with: docker compose up -d piped piped-proxy piped-bg-helper piped-db
+  # Then set PIPED_API_URL=http://localhost:8081 when running server.py
+  piped:
+    # Community fix for "The page needs to be reloaded" YouTube bot detection
+    # See: https://github.com/TeamPiped/Piped/issues/4139
+    image: nieveve/piped-backend:latest
+    container_name: piped-backend
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./piped-config.properties:/app/config.properties:ro
+    depends_on:
+      piped-db:
+        condition: service_healthy
+    profiles:
+      - piped
+
+  piped-proxy:
+    image: 1337kavin/piped-proxy:latest
+    container_name: piped-proxy
+    restart: unless-stopped
+    ports:
+      - "8082:8080"
+    profiles:
+      - piped
+
+  piped-bg-helper:
+    image: 1337kavin/bg-helper-server:latest
+    container_name: piped-bg-helper
+    restart: unless-stopped
+    profiles:
+      - piped
+
+  piped-db:
+    image: pgautoupgrade/pgautoupgrade:16-alpine
+    container_name: piped-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: piped
+      POSTGRES_USER: piped
+      POSTGRES_PASSWORD: changeme
+    volumes:
+      - piped-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U piped -d piped"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - piped
+
 volumes:
   postgres-data:
   companioncache:
+  piped-db-data:
