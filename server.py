@@ -15,6 +15,8 @@ import os
 import uuid
 from datetime import datetime
 import time
+import requests
+import re
 
 
 # Increase Flask request timeout
@@ -29,23 +31,101 @@ class TimeoutMiddleware:
 
 app = Flask(__name__)
 
+# Backend Configuration
+DEFAULT_BACKEND = os.getenv("DEFAULT_BACKEND", "yt-dlp")
+INVIDIOUS_URL = os.getenv("INVIDIOUS_URL", "http://localhost:3000")
+
 # S3 Configuration
 S3_BUCKET = os.getenv("S3_BUCKET", "huski-tmp-new")
 S3_REGION = os.getenv("AWS_REGION", "us-east-1")
+
+
+def extract_video_id(url):
+    """Extract YouTube video ID from URL."""
+    import re
+
+    patterns = [
+        r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})",
+        r"^([a-zA-Z0-9_-]{11})$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
+def get_video_info_invidious(video_id):
+    """Get video info from Invidious API."""
+    import requests
+
+    api_url = f"{INVIDIOUS_URL}/api/v1/videos/{video_id}?local=true"
+    print(f"Fetching video info from Invidious: {api_url}", file=sys.stderr)
+
+    try:
+        response = requests.get(api_url, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        formats = []
+        for fmt in data.get("adaptiveFormats", []):
+            if fmt.get("type", "").startswith("video") and fmt.get("url"):
+                itag = fmt.get("itag", "")
+                # Extract height from resolution field (e.g. "1080p" -> 1080)
+                resolution = fmt.get("resolution", "")
+                quality_label = fmt.get("qualityLabel", "")
+                height = fmt.get("height") or 0
+                if not height and resolution:
+                    match = re.match(r"(\d+)p", resolution)
+                    if match:
+                        height = int(match.group(1))
+                if height > 0:
+                    url = fmt.get("url", "")
+                    # local=true returns relative URLs, prepend Invidious host
+                    if url.startswith("/"):
+                        url = f"{INVIDIOUS_URL}{url}"
+                    formats.append(
+                        {
+                            "quality": quality_label or f"{height}p",
+                            "url": url,
+                            "itag": str(itag),
+                            "ext": "mp4",
+                            "height": height,
+                        }
+                    )
+
+        # Deduplicate by height, keeping first (usually mp4/avc1)
+        seen_heights = set()
+        unique_formats = []
+        for fmt in formats:
+            if fmt["height"] not in seen_heights:
+                seen_heights.add(fmt["height"])
+                unique_formats.append(fmt)
+        formats = unique_formats
+
+        # Sort by height descending
+        formats.sort(key=lambda x: x["height"], reverse=True)
+
+        return {
+            "title": data.get("title", "YouTube Video"),
+            "thumbnail": data.get("thumbnailUrl"),
+            "duration": data.get("lengthSeconds", 0),
+            "formats": formats[:10],
+            "videoId": video_id,
+        }
+    except Exception as e:
+        print(f"Invidious API error: {e}", file=sys.stderr)
+        raise Exception(f"Invidious error: {str(e)}")
+
 
 # Initialize S3 client - reads from ~/.aws/credentials by default
 s3_client = boto3.client(
     "s3",
     region_name=S3_REGION,
 )
-    s3_client = None
-else:
-    s3_client = boto3.client(
-        "s3",
-        region_name=S3_REGION,
-        aws_access_key_id=aws_access_key,
-        aws_secret_access_key=aws_secret_key,
-    )
+
+# Store active uploads for progress tracking
+active_uploads = {}
 
 
 @app.route("/")
@@ -63,11 +143,31 @@ def serve_pkg(filename):
 
 @app.route("/api/video")
 def get_video():
-    """API endpoint to get video info using yt-dlp."""
+    """API endpoint to get video info."""
     url = request.args.get("url")
+    backend = request.args.get("backend", DEFAULT_BACKEND)
+
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
+    # Override backend if specified in query param
+    if request.args.get("backend"):
+        backend = request.args.get("backend")
+
+    print(f"Using backend: {backend} for video info", file=sys.stderr)
+
+    # Extract video ID for Invidious
+    video_id = extract_video_id(url)
+
+    if backend == "invidious" and video_id:
+        try:
+            info = get_video_info_invidious(video_id)
+            info["backend"] = "invidious"
+            return jsonify(info)
+        except Exception as e:
+            return jsonify({"error": str(e), "backend": "invidious"}), 500
+
+    # Default: use yt-dlp
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -117,6 +217,7 @@ def get_video():
             "formats": formats[:10],
             "thumbnail": info.get("thumbnail"),
             "duration": info.get("duration"),
+            "backend": "yt-dlp",
         }
 
         return jsonify(result)
@@ -133,109 +234,123 @@ def upload_to_s3():
     video_url = data.get("url")
     title = data.get("title", "video")
     quality = data.get("quality", "best")
+    backend = data.get("backend", DEFAULT_BACKEND)
 
     if not video_url:
         return jsonify({"error": "No URL provided"}), 400
 
+    print(
+        f"Starting S3 upload for: {title} (quality: {quality}, backend: {backend})",
+        file=sys.stderr,
+    )
+
+    # Generate unique filename
+    safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip()[:50]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique_id = str(uuid.uuid4())[:8]
+    s3_key = f"youtube/{safe_title}_{timestamp}_{unique_id}.mp4"
+    temp_dir = "/tmp"
+    temp_filename = f"{temp_dir}/yt_{unique_id}.mp4"
+
     try:
-        print(f"Starting S3 upload for: {title} (quality: {quality})", file=sys.stderr)
+        if backend == "invidious":
+            # Invidious path
+            video_id = extract_video_id(video_url)
+            if not video_id:
+                raise Exception("Could not extract video ID from URL")
 
-        # Parse quality - could be "1280x720" or "best"
-        if quality and quality != "best":
-            try:
-                if "x" in str(quality):
-                    # It's a resolution like "1280x720"
-                    height = int(quality.split("x")[1])
-                    # Use mp4 format only
-                    format_str = f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]/best"
-                else:
-                    # It's a format_id/itag
-                    format_str = f"format_id/{quality}/best"
-            except Exception as e:
-                print(f"Parse error: {e}", file=sys.stderr)
-                format_str = "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best"
+            # Get video info from Invidious to find the best quality URL
+            info = get_video_info_invidious(video_id)
+
+            # Select format based on quality
+            selected_format = None
+            if quality and quality != "best":
+                # Parse target height from quality string like "1080p" or "1920x1080"
+                target_height = 0
+                height_match = re.search(r"(\d+)p?$", str(quality))
+                if height_match:
+                    target_height = int(height_match.group(1))
+                for fmt in info.get("formats", []):
+                    fmt_height = fmt.get("height", 0)
+                    if fmt_height and fmt_height <= target_height:
+                        selected_format = fmt
+                        break
+            if not selected_format and info.get("formats"):
+                selected_format = info["formats"][0]  # Best quality
+
+            if not selected_format:
+                raise Exception("No suitable format found")
+
+            direct_url = selected_format["url"]
+            print(f"Downloading from Invidious: {direct_url[:80]}...", file=sys.stderr)
+
+            # Download video from Invidious URL
+            req = urllib.request.Request(direct_url)
+            req.add_header("User-Agent", "Mozilla/5.0")
+            req.add_header("Accept", "*/*")
+
+            with open(temp_filename, "wb") as f:
+                response = urllib.request.urlopen(req, timeout=600)
+                while True:
+                    chunk = response.read(8192)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                response.close()
+
         else:
-            # Default: prefer mp4
-            format_str = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+            # yt-dlp path (default)
+            # Parse quality - could be "1280x720" or "best"
+            if quality and quality != "best":
+                try:
+                    if "x" in str(quality):
+                        height = int(quality.split("x")[1])
+                        format_str = f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]/best"
+                    else:
+                        format_str = f"format_id/{quality}/best"
+                except Exception as e:
+                    print(f"Parse error: {e}", file=sys.stderr)
+                    format_str = "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best"
+            else:
+                format_str = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 
-        print(f"Using format: {format_str}, quality: {quality}", file=sys.stderr)
+            print(f"Using format: {format_str}, quality: {quality}", file=sys.stderr)
 
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "format": format_str,
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-
-            # Debug: print selected format info
+            # Download video to temp file using yt-dlp
             print(
-                f"Selected format: {info.get('format_id')}, height: {info.get('height')}, resolution: {info.get('resolution')}",
-                file=sys.stderr,
+                f"Downloading video using yt-dlp to {temp_filename}...", file=sys.stderr
             )
 
-            # Get direct URL - try different sources
-            direct_url = info.get("url")
+            ydl_opts = {
+                "format": format_str,
+                "outtmpl": temp_filename,
+                "quiet": True,
+                "no_warnings": True,
+                "retries": 3,
+                "fragment_retries": 3,
+            }
 
-            # Fallback: check requested_formats for video+audio merged format
-            if not direct_url and info.get("requested_formats"):
-                for fmt in info.get("requested_formats", []):
-                    if fmt.get("url") and fmt.get("vcodec", "none") != "none":
-                        direct_url = fmt.get("url")
-                        print(
-                            f"Got URL from requested_formats: {fmt.get('format_id')}",
-                            file=sys.stderr,
-                        )
-                        break
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video_url])
 
-            if not direct_url:
-                raise Exception("Could not get video URL")
+        # Upload temp file to S3
+        print(f"Uploading {temp_filename} to S3...", file=sys.stderr)
 
-            print(f"Got video URL", file=sys.stderr)
-
-            # Fallback: check requested_formats
-            if not direct_url and info.get("requested_formats"):
-                for fmt in info.get("requested_formats", []):
-                    if fmt.get("url") and fmt.get("vcodec", "none") != "none":
-                        direct_url = fmt.get("url")
-                        break
-
-            if not direct_url:
-                raise Exception("Could not get video URL")
-
-            print(f"Got video URL", file=sys.stderr)
-
-        # Generate unique filename
-        safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip()[:50]
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_id = str(uuid.uuid4())[:8]
-        s3_key = f"youtube/{safe_title}_{timestamp}_{unique_id}.mp4"
-
-        # Download video content
-        print(f"Downloading video from: {direct_url[:80]}...", file=sys.stderr)
-
-        req = urllib.request.Request(direct_url)
-        req.add_header("User-Agent", "Mozilla/5.0")
-        req.add_header("Range", "bytes=0-")  # Support partial content
-
-        # Use longer timeout for download
-        response = urllib.request.urlopen(req, timeout=300)
-        video_data = response.read()
-        response.close()
-
-        print(
-            f"Downloaded {len(video_data)} bytes, uploading to S3...", file=sys.stderr
-        )
-
-        # Upload to S3
-        s3_client.put_object(
-            Bucket=S3_BUCKET,
-            Key=s3_key,
-            Body=video_data,
-            ContentType="video/mp4",
-            ACL="public-read",
-        )
+        try:
+            with open(temp_filename, "rb") as f:
+                s3_client.put_object(
+                    Bucket=S3_BUCKET,
+                    Key=s3_key,
+                    Body=f,
+                    ContentType="video/mp4",
+                    ACL="public-read",
+                )
+            os.remove(temp_filename)
+        except Exception as e:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+            print(f"S3 upload error: {e}", file=sys.stderr)
+            raise Exception(f"Failed to upload to S3: {str(e)}")
 
         # Generate S3 URL
         s3_url = f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{s3_key}"
@@ -243,7 +358,12 @@ def upload_to_s3():
         print(f"Upload complete: {s3_url}", file=sys.stderr)
 
         return jsonify(
-            {"success": True, "s3_url": s3_url, "filename": s3_key.split("/")[-1]}
+            {
+                "success": True,
+                "s3_url": s3_url,
+                "filename": s3_key.split("/")[-1],
+                "backend": backend,
+            }
         )
 
     except Exception as e:
@@ -304,7 +424,8 @@ def download_video():
 
 if __name__ == "__main__":
     print("Starting YouTube Downloader Server...")
-    print("Using yt-dlp for video extraction")
+    print(f"Default backend: {DEFAULT_BACKEND}")
+    print(f"Invidious URL: {INVIDIOUS_URL}")
     print(f"Uploading to S3 bucket: {S3_BUCKET}")
     print("Open http://localhost:8080 in your browser")
     print("Multiple concurrent downloads: ENABLED")

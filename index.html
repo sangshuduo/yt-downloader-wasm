@@ -132,7 +132,7 @@
     </div>
 
     <script type="module">
-        import init, { validate_youtube_url, extract_video_id } from './pkg/yt_downloader_wasm.js';
+        import init, { validate_youtube_url, extract_video_id, sanitize_filename, format_duration, parse_quality, get_quality_label } from './pkg/yt_downloader_wasm.js';
 
         const urlInput = document.getElementById('urlInput');
         const downloadBtn = document.getElementById('downloadBtn');
@@ -140,31 +140,43 @@
         let wasmLoaded = false;
         let currentYouTubeUrl = '';
         let currentTitle = '';
+        let currentBackend = 'yt-dlp';
 
         async function loadWasm() {
             try {
                 await init();
                 wasmLoaded = true;
-                console.log('WASM loaded');
+                console.log('WASM loaded successfully');
+                // Test WASM function
+                const test = extract_video_id('https://youtube.com/watch?v=test');
+                console.log('WASM test result:', test);
             } catch (error) {
-                console.error('WASM error:', error);
+                console.error('WASM load error:', error);
+                wasmLoaded = false;
             }
         }
         loadWasm();
 
         function extractVideoIdFromUrl(url) {
-            if (wasmLoaded) {
-                const result = extract_video_id(url);
-                return result || null;
-            }
+            console.log('Input URL:', url);
+            
+            // JavaScript fallback - always use this for reliability
             const patterns = [
-                /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)/,
-                /youtube\.com\/shorts\/([^&\n?#]+)/
+                /youtube\.com\/watch\?v=([^&\s]+)/,
+                /youtu\.be\/([^\s\?]+)/,
+                /youtube\.com\/embed\/([^\s\?]+)/,
+                /youtube\.com\/shorts\/([^\s\?]+)/
             ];
+            
             for (const pattern of patterns) {
                 const match = url.match(pattern);
-                if (match) return match[1];
+                if (match && match[1]) {
+                    console.log('Matched:', match[1]);
+                    return match[1];
+                }
             }
+            
+            console.log('No match found');
             return null;
         }
 
@@ -205,7 +217,8 @@
                     body: JSON.stringify({
                         url: currentYouTubeUrl,
                         title: currentTitle,
-                        quality: selectedQuality
+                        quality: selectedQuality,
+                        backend: currentBackend
                     })
                 });
 
@@ -259,12 +272,14 @@
             showLoading();
 
             try {
-                const { title, formats } = await getVideoInfo(videoId);
+                const result = await getVideoInfo(videoId);
+                const { title, formats, duration, backend } = result;
                 if (!formats || formats.length === 0) {
                     showError('No downloadable formats found');
                     return;
                 }
-                showSuccess(title, formats);
+                currentBackend = backend || 'invidious';
+                showSuccess(title, formats, duration, currentBackend);
             } catch (error) {
                 showError(error.message);
             } finally {
@@ -282,7 +297,24 @@
             resultDiv.innerHTML = `<strong>Error:</strong> ${message}`;
         }
 
-        function showSuccess(title, formats) {
+        function showSuccess(title, formats, duration, backend) {
+            // Use WASM to sanitize filename
+            const safeTitle = wasmLoaded ? sanitize_filename(title) : title.replace(/[^a-z0-9]/gi, '_');
+            
+            // Format duration with JavaScript (avoid WASM BigInt issues)
+            let formattedDuration = '';
+            if (duration) {
+                const secs = parseInt(duration);
+                if (!isNaN(secs)) {
+                    const hours = Math.floor(secs / 3600);
+                    const mins = Math.floor((secs % 3600) / 60);
+                    const s = secs % 60;
+                    formattedDuration = hours > 0 
+                        ? `${hours.toString().padStart(2,'0')}:${mins.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`
+                        : `${mins.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
+                }
+            }
+            
             resultDiv.className = 'result success';
             
             // Remove duplicates and create radio options
@@ -307,6 +339,8 @@
                 <strong>Video Found!</strong>
                 <div class="video-info">
                     <div class="video-title">${title}</div>
+                    ${formattedDuration ? `<p>Duration: ${formattedDuration}</p>` : ''}
+                    <p>Backend: <strong>${backend || 'invidious'}</strong></p>
                     <p>Select quality:</p>
                     <div class="formats">${radioButtons}</div>
                     <button class="format-btn upload-s3" id="uploadS3Btn" style="margin-top:15px;width:100%">
@@ -314,6 +348,9 @@
                     </button>
                 </div>
             `;
+
+            // Store safe title for download
+            currentTitle = safeTitle;
 
             document.getElementById('uploadS3Btn').addEventListener('click', uploadToS3);
         }
