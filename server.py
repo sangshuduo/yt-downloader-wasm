@@ -30,17 +30,22 @@ class TimeoutMiddleware:
         return self.app(environ, start_response)
 
 
+def get_random_backend():
+    """Randomly select a backend from available options."""
+    return random.choice(["yt-dlp", "invidious", "piped"])
+
+
 app = Flask(__name__)
 
 # Backend Configuration
 INVIDIOUS_URL = os.getenv("INVIDIOUS_URL", "http://localhost:3000")
-# Auto-detect default backend from env: explicit > PIPED_API_URL > yt-dlp
+# Auto-detect default backend from env: explicit > PIPED_API_URL > random
 if os.getenv("DEFAULT_BACKEND"):
     DEFAULT_BACKEND = os.getenv("DEFAULT_BACKEND")
 elif os.getenv("PIPED_API_URL"):
     DEFAULT_BACKEND = "piped"
 else:
-    DEFAULT_BACKEND = "yt-dlp"
+    DEFAULT_BACKEND = "random"
 
 # Piped public API instances (randomly selected, with retry fallback)
 # Full list from https://github.com/TeamPiped/documentation and community sources
@@ -100,10 +105,30 @@ PIPED_INSTANCES = [
 if os.getenv("PIPED_INSTANCES"):
     PIPED_INSTANCES = [u.strip() for u in os.getenv("PIPED_INSTANCES").split(",")]
 # Self-hosted Piped instance URL (used when running Piped via Docker Compose)
-PIPED_SELF_HOSTED_URL = os.getenv("PIPED_API_URL", "")
+PIPED_SELF_HOSTED_URL = os.getenv("PIPED_API_URL", "http://localhost:8081")
 
-# S3 Configuration
-S3_BUCKET = os.getenv("S3_BUCKET", "huski-tmp-new")
+# Config file persistence
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
+DEFAULT_RESOLUTIONS = ["best", "2160p", "1440p", "1080p", "720p", "480p", "360p", "240p"]
+
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    return {"default_resolution": "1080p"}
+
+
+def save_config(data):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+app_config = load_config()
+DEFAULT_RESOLUTION = app_config.get("default_resolution", "1080p")
+
+# S3 Configuration — config.json takes precedence over env var, no hardcoded default
+S3_BUCKET = app_config.get("s3_bucket") or os.getenv("S3_BUCKET", "")
 S3_REGION = os.getenv("AWS_REGION", "us-east-1")
 
 
@@ -342,7 +367,7 @@ def index():
         html = f.read()
     html = html.replace(
         "<!--SERVER_CONFIG-->",
-        f"<script>window.DEFAULT_BACKEND = '{DEFAULT_BACKEND}';</script>",
+        f"<script>window.DEFAULT_BACKEND = '{DEFAULT_BACKEND}'; window.DEFAULT_RESOLUTION = '{DEFAULT_RESOLUTION}'; window.S3_BUCKET = '{S3_BUCKET}';</script>",
     )
     return html
 
@@ -351,6 +376,30 @@ def index():
 def serve_pkg(filename):
     """Serve WASM package files."""
     return send_from_directory("pkg", filename)
+
+
+@app.route("/api/config", methods=["GET"])
+def get_config():
+    """Return current user config."""
+    return jsonify({"default_resolution": DEFAULT_RESOLUTION, "s3_bucket": S3_BUCKET})
+
+
+@app.route("/api/config", methods=["POST"])
+def set_config():
+    """Update and persist user config."""
+    global DEFAULT_RESOLUTION, S3_BUCKET, app_config
+    data = request.get_json()
+    if "default_resolution" in data:
+        resolution = data["default_resolution"]
+        if resolution not in DEFAULT_RESOLUTIONS:
+            return jsonify({"error": f"Invalid resolution. Must be one of: {DEFAULT_RESOLUTIONS}"}), 400
+        app_config["default_resolution"] = resolution
+        DEFAULT_RESOLUTION = resolution
+    if "s3_bucket" in data:
+        S3_BUCKET = data["s3_bucket"]
+        app_config["s3_bucket"] = S3_BUCKET
+    save_config(app_config)
+    return jsonify({"default_resolution": DEFAULT_RESOLUTION, "s3_bucket": S3_BUCKET})
 
 
 @app.route("/api/video")
@@ -366,85 +415,120 @@ def get_video():
     if request.args.get("backend"):
         backend = request.args.get("backend")
 
-    print(f"Using backend: {backend} for video info", file=sys.stderr)
+    # Determine which backends to try
+    if backend == "random":
+        backends_to_try = ["yt-dlp", "invidious", "piped"]
+        random.shuffle(backends_to_try)
+        print(
+            f"Random backends to try: {backends_to_try} for video info", file=sys.stderr
+        )
+    else:
+        backends_to_try = [backend]
 
     # Extract video ID for Invidious
     video_id = extract_video_id(url)
 
-    if backend == "invidious" and video_id:
-        try:
-            info = get_video_info_invidious(video_id)
-            info["backend"] = "invidious"
-            return jsonify(info)
-        except Exception as e:
-            return jsonify({"error": str(e), "backend": "invidious"}), 500
+    last_error = None
+    used_backend = None
 
-    if backend == "piped" and video_id:
-        try:
-            info = get_video_info_piped(video_id)
-            info["backend"] = "piped"
-            return jsonify(info)
-        except Exception as e:
-            return jsonify({"error": str(e), "backend": "piped"}), 500
+    for current_backend in backends_to_try:
+        used_backend = current_backend
+        print(f"Trying backend: {current_backend} for video info", file=sys.stderr)
 
-    # Default: use yt-dlp
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "format": "best[ext=mp4]/best",
-        "extract_flat": False,
-    }
+        if current_backend == "invidious" and video_id:
+            try:
+                info = get_video_info_invidious(video_id)
+                info["backend"] = "invidious"
+                print(f"Success using backend: invidious", file=sys.stderr)
+                return jsonify(info)
+            except Exception as e:
+                print(f"Invidious failed: {e}", file=sys.stderr)
+                last_error = str(e)
+                continue
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        if current_backend == "piped" and video_id:
+            try:
+                info = get_video_info_piped(video_id)
+                info["backend"] = "piped"
+                print(f"Success using backend: piped", file=sys.stderr)
+                return jsonify(info)
+            except Exception as e:
+                print(f"Piped failed: {e}", file=sys.stderr)
+                last_error = str(e)
+                continue
 
-        formats = []
+        # Default: use yt-dlp
+        if current_backend == "yt-dlp":
+            ydl_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "format": "best[ext=mp4]/best",
+                "extract_flat": False,
+            }
 
-        # Get all video formats - only MP4
-        if "formats" in info:
-            for fmt in info["formats"]:
-                # Only include video formats with direct URLs, prefer mp4
-                if fmt.get("url") and fmt.get("vcodec", "none") != "none":
-                    ext = fmt.get("ext", "")
-                    if ext == "mp4":  # Only show mp4 formats
-                        quality = fmt.get("resolution", fmt.get("height", "Unknown"))
-                        # Add more detail to quality string
-                        if fmt.get("height"):
-                            quality = f"{fmt.get('width', '')}x{fmt.get('height')}"
-                        formats.append(
-                            {
-                                "quality": str(quality),
-                                "url": fmt.get("url"),
-                                "itag": fmt.get("format_id"),
-                                "ext": fmt.get("ext", "mp4"),
-                            }
-                        )
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
 
-        # If no formats found, try the best format
-        if not formats and info.get("url"):
-            formats.append(
-                {
-                    "quality": "best",
-                    "url": info.get("url"),
-                    "itag": "best",
-                    "ext": "mp4",
+                formats = []
+
+                # Get all video formats - only MP4
+                if "formats" in info:
+                    for fmt in info["formats"]:
+                        # Only include video formats with direct URLs, prefer mp4
+                        if fmt.get("url") and fmt.get("vcodec", "none") != "none":
+                            ext = fmt.get("ext", "")
+                            if ext == "mp4":  # Only show mp4 formats
+                                quality = fmt.get(
+                                    "resolution", fmt.get("height", "Unknown")
+                                )
+                                # Add more detail to quality string
+                                if fmt.get("height"):
+                                    quality = (
+                                        f"{fmt.get('width', '')}x{fmt.get('height')}"
+                                    )
+                                formats.append(
+                                    {
+                                        "quality": str(quality),
+                                        "url": fmt.get("url"),
+                                        "itag": fmt.get("format_id"),
+                                        "ext": fmt.get("ext", "mp4"),
+                                    }
+                                )
+
+                # If no formats found, try the best format
+                if not formats and info.get("url"):
+                    formats.append(
+                        {
+                            "quality": "best",
+                            "url": info.get("url"),
+                            "itag": "best",
+                            "ext": "mp4",
+                        }
+                    )
+
+                result = {
+                    "title": info.get("title", "YouTube Video"),
+                    "formats": formats[:10],
+                    "thumbnail": info.get("thumbnail"),
+                    "duration": info.get("duration"),
+                    "backend": "yt-dlp",
                 }
-            )
 
-        result = {
-            "title": info.get("title", "YouTube Video"),
-            "formats": formats[:10],
-            "thumbnail": info.get("thumbnail"),
-            "duration": info.get("duration"),
-            "backend": "yt-dlp",
+                print(f"Success using backend: yt-dlp", file=sys.stderr)
+                return jsonify(result)
+            except Exception as e:
+                print(f"yt-dlp failed: {e}", file=sys.stderr)
+                last_error = str(e)
+                continue
+
+    # All backends failed
+    return jsonify(
+        {
+            "error": f"All backends failed. Last error: {last_error}",
+            "backend": used_backend,
         }
-
-        return jsonify(result)
-
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return jsonify({"error": str(e)}), 500
+    ), 500
 
 
 @app.route("/api/upload-s3", methods=["POST"])
@@ -459,8 +543,18 @@ def upload_to_s3():
     if not video_url:
         return jsonify({"error": "No URL provided"}), 400
 
+    if not S3_BUCKET:
+        return jsonify({"error": "S3 bucket name not configured. Set it in the UI or via the S3_BUCKET environment variable."}), 400
+
+    # Determine which backends to try
+    if backend == "random":
+        backends_to_try = ["yt-dlp", "invidious", "piped"]
+        random.shuffle(backends_to_try)
+    else:
+        backends_to_try = [backend]
+
     print(
-        f"Starting S3 upload for: {title} (quality: {quality}, backend: {backend})",
+        f"Starting S3 upload for: {title} (quality: {quality}, backends to try: {backends_to_try})",
         file=sys.stderr,
     )
 
@@ -470,127 +564,162 @@ def upload_to_s3():
     unique_id = str(uuid.uuid4())[:8]
     s3_key = f"youtube/{safe_title}_{timestamp}_{unique_id}.mp4"
     temp_dir = "/tmp"
-    temp_filename = f"{temp_dir}/yt_{unique_id}.mp4"
 
-    try:
-        if backend in ("invidious", "piped"):
-            video_id = extract_video_id(video_url)
-            if not video_id:
-                raise Exception("Could not extract video ID from URL")
+    last_error = None
+    used_backend = None
 
-            # Get video info from the selected backend
-            if backend == "piped":
-                info = get_video_info_piped(video_id)
-            else:
-                info = get_video_info_invidious(video_id)
+    for current_backend in backends_to_try:
+        used_backend = current_backend
+        temp_filename = f"{temp_dir}/yt_{unique_id}_{current_backend}.mp4"
 
-            # Select format based on quality
-            selected_format = None
-            if quality and quality != "best":
-                # Parse target height from quality string like "1080p" or "1920x1080"
-                target_height = 0
-                height_match = re.search(r"(\d+)p?$", str(quality))
-                if height_match:
-                    target_height = int(height_match.group(1))
-                for fmt in info.get("formats", []):
-                    fmt_height = fmt.get("height", 0)
-                    if fmt_height and fmt_height <= target_height:
-                        selected_format = fmt
-                        break
-            if not selected_format and info.get("formats"):
-                selected_format = info["formats"][0]  # Best quality
-
-            if not selected_format:
-                raise Exception("No suitable format found")
-
-            direct_url = selected_format["url"]
-            print(f"Downloading from {backend}: {direct_url[:80]}...", file=sys.stderr)
-
-            # Download video from direct URL
-            req = urllib.request.Request(direct_url)
-            req.add_header("User-Agent", "Mozilla/5.0")
-            req.add_header("Accept", "*/*")
-
-            with open(temp_filename, "wb") as f:
-                response = urllib.request.urlopen(req, timeout=600)
-                while True:
-                    chunk = response.read(8192)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                response.close()
-
-        else:
-            # yt-dlp path (default)
-            # Parse quality - could be "1280x720" or "best"
-            if quality and quality != "best":
-                try:
-                    if "x" in str(quality):
-                        height = int(quality.split("x")[1])
-                        format_str = f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]/best"
-                    else:
-                        format_str = f"format_id/{quality}/best"
-                except Exception as e:
-                    print(f"Parse error: {e}", file=sys.stderr)
-                    format_str = "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best"
-            else:
-                format_str = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-
-            print(f"Using format: {format_str}, quality: {quality}", file=sys.stderr)
-
-            # Download video to temp file using yt-dlp
-            print(
-                f"Downloading video using yt-dlp to {temp_filename}...", file=sys.stderr
-            )
-
-            ydl_opts = {
-                "format": format_str,
-                "outtmpl": temp_filename,
-                "quiet": True,
-                "no_warnings": True,
-                "retries": 3,
-                "fragment_retries": 3,
-            }
-
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([video_url])
-
-        # Upload temp file to S3
-        print(f"Uploading {temp_filename} to S3...", file=sys.stderr)
-
-        try:
-            with open(temp_filename, "rb") as f:
-                s3_client.put_object(
-                    Bucket=S3_BUCKET,
-                    Key=s3_key,
-                    Body=f,
-                    ContentType="video/mp4",
-                    ACL="public-read",
-                )
-            os.remove(temp_filename)
-        except Exception as e:
-            if os.path.exists(temp_filename):
-                os.remove(temp_filename)
-            print(f"S3 upload error: {e}", file=sys.stderr)
-            raise Exception(f"Failed to upload to S3: {str(e)}")
-
-        # Generate S3 URL
-        s3_url = f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{s3_key}"
-
-        print(f"Upload complete: {s3_url}", file=sys.stderr)
-
-        return jsonify(
-            {
-                "success": True,
-                "s3_url": s3_url,
-                "filename": s3_key.split("/")[-1],
-                "backend": backend,
-            }
+        print(
+            f"Trying backend: {current_backend} for: {title}",
+            file=sys.stderr,
         )
 
-    except Exception as e:
-        print(f"S3 Upload error: {e}", file=sys.stderr)
-        return jsonify({"error": str(e)}), 500
+        try:
+            if current_backend in ("invidious", "piped"):
+                video_id = extract_video_id(video_url)
+                if not video_id:
+                    raise Exception("Could not extract video ID from URL")
+
+                # Get video info from the selected backend
+                if current_backend == "piped":
+                    info = get_video_info_piped(video_id)
+                else:
+                    info = get_video_info_invidious(video_id)
+
+                # Select format based on quality
+                selected_format = None
+                if quality and quality != "best":
+                    # Parse target height from quality string like "1080p" or "1920x1080"
+                    target_height = 0
+                    height_match = re.search(r"(\d+)p?$", str(quality))
+                    if height_match:
+                        target_height = int(height_match.group(1))
+                    for fmt in info.get("formats", []):
+                        fmt_height = fmt.get("height", 0)
+                        if fmt_height and fmt_height <= target_height:
+                            selected_format = fmt
+                            break
+                if not selected_format and info.get("formats"):
+                    selected_format = info["formats"][0]  # Best quality
+
+                if not selected_format:
+                    raise Exception("No suitable format found")
+
+                direct_url = selected_format["url"]
+                print(
+                    f"Downloading from {current_backend}: {direct_url[:80]}...",
+                    file=sys.stderr,
+                )
+
+                # Download video from direct URL
+                req = urllib.request.Request(direct_url)
+                req.add_header("User-Agent", "Mozilla/5.0")
+                req.add_header("Accept", "*/*")
+
+                with open(temp_filename, "wb") as f:
+                    response = urllib.request.urlopen(req, timeout=600)
+                    while True:
+                        chunk = response.read(8192)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                    response.close()
+
+            else:
+                # yt-dlp path (default)
+                # Parse quality - could be "1280x720" or "best"
+                if quality and quality != "best":
+                    try:
+                        if "x" in str(quality):
+                            height = int(quality.split("x")[1])
+                            format_str = f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]/best"
+                        else:
+                            format_str = f"format_id/{quality}/best"
+                    except Exception as e:
+                        print(f"Parse error: {e}", file=sys.stderr)
+                        format_str = "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best"
+                else:
+                    format_str = (
+                        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+                    )
+
+                print(
+                    f"Using format: {format_str}, quality: {quality}", file=sys.stderr
+                )
+
+                # Download video to temp file using yt-dlp
+                print(
+                    f"Downloading video using yt-dlp to {temp_filename}...",
+                    file=sys.stderr,
+                )
+
+                ydl_opts = {
+                    "format": format_str,
+                    "outtmpl": temp_filename,
+                    "quiet": True,
+                    "no_warnings": True,
+                    "retries": 3,
+                    "fragment_retries": 3,
+                }
+
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([video_url])
+
+            # Upload temp file to S3
+            print(f"Uploading {temp_filename} to S3...", file=sys.stderr)
+
+            try:
+                with open(temp_filename, "rb") as f:
+                    s3_client.put_object(
+                        Bucket=S3_BUCKET,
+                        Key=s3_key,
+                        Body=f,
+                        ContentType="video/mp4",
+                        ACL="public-read",
+                    )
+                os.remove(temp_filename)
+            except Exception as e:
+                if os.path.exists(temp_filename):
+                    os.remove(temp_filename)
+                print(f"S3 upload error: {e}", file=sys.stderr)
+                raise Exception(f"Failed to upload to S3: {str(e)}")
+
+            # Generate S3 URL
+            s3_url = f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{s3_key}"
+
+            print(f"Upload complete using backend: {used_backend}", file=sys.stderr)
+
+            return jsonify(
+                {
+                    "success": True,
+                    "s3_url": s3_url,
+                    "filename": s3_key.split("/")[-1],
+                    "backend": used_backend,
+                }
+            )
+
+        except Exception as e:
+            print(f"Backend {current_backend} failed: {e}", file=sys.stderr)
+            last_error = str(e)
+            # Clean up temp file if it exists
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+            # Try next backend
+            continue
+
+    # All backends failed
+    print(
+        f"All backends failed for: {title}. Last error: {last_error}", file=sys.stderr
+    )
+    return jsonify(
+        {
+            "error": f"All backends failed. Last error: {last_error}",
+            "tried_backends": backends_to_try,
+        }
+    ), 500
 
 
 @app.route("/api/download")
