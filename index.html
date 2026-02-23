@@ -135,6 +135,52 @@
             border-color: #667eea;
             background: #e8eeff;
         }
+        .resolution-selector {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 20px;
+            justify-content: center;
+        }
+        .resolution-selector label {
+            font-size: 14px;
+            color: #555;
+        }
+        .resolution-selector select {
+            padding: 6px 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            outline: none;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+        .resolution-selector select:focus {
+            border-color: #667eea;
+        }
+        .bucket-input {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 20px;
+            justify-content: center;
+        }
+        .bucket-input label {
+            font-size: 14px;
+            color: #555;
+            white-space: nowrap;
+        }
+        .bucket-input input[type="text"] {
+            min-width: 0;
+            width: 220px;
+            padding: 6px 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+        .bucket-input input[type="text"]:focus {
+            border-color: #667eea;
+        }
         .spinner {
             border: 3px solid #f3f3f3; border-top: 3px solid #667eea;
             border-radius: 50%; width: 30px; height: 30px;
@@ -151,9 +197,29 @@
         <p class="subtitle">Download YouTube videos and upload to S3 bucket</p>
         
         <div class="backend-selector">
-            <label><input type="radio" name="backend" value="yt-dlp" checked><span>yt-dlp</span></label>
+            <label><input type="radio" name="backend" value="random" checked><span>Random backend</span></label>
+            <label><input type="radio" name="backend" value="yt-dlp"><span>yt-dlp</span></label>
             <label><input type="radio" name="backend" value="invidious"><span>Invidious</span></label>
             <label><input type="radio" name="backend" value="piped"><span>Piped</span></label>
+        </div>
+
+        <div class="resolution-selector">
+            <label for="default-resolution">Default Resolution:</label>
+            <select id="default-resolution">
+                <option value="best">Best available</option>
+                <option value="2160p">2160p (4K)</option>
+                <option value="1440p">1440p</option>
+                <option value="1080p">1080p</option>
+                <option value="720p">720p</option>
+                <option value="480p">480p</option>
+                <option value="360p">360p</option>
+                <option value="240p">240p</option>
+            </select>
+        </div>
+
+        <div class="bucket-input">
+            <label for="s3-bucket">S3 Bucket:</label>
+            <input type="text" id="s3-bucket" placeholder="your-bucket-name" />
         </div>
 
         <div class="input-group">
@@ -173,11 +239,38 @@
         let wasmLoaded = false;
         let currentYouTubeUrl = '';
         let currentTitle = '';
+        let currentQuality = 'best';
         let currentBackend = window.DEFAULT_BACKEND || 'yt-dlp';
 
         // Set the backend radio button to match server default
         const defaultRadio = document.querySelector(`input[name="backend"][value="${currentBackend}"]`);
         if (defaultRadio) defaultRadio.checked = true;
+
+        // Initialize resolution dropdown from server-injected value
+        const resolutionSelect = document.getElementById('default-resolution');
+        resolutionSelect.value = window.DEFAULT_RESOLUTION || '1080p';
+
+        // Persist resolution preference on change
+        resolutionSelect.addEventListener('change', async (e) => {
+            await fetch('/api/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ default_resolution: e.target.value })
+            });
+        });
+
+        // Initialize S3 bucket input from server-injected value
+        const bucketInput = document.getElementById('s3-bucket');
+        bucketInput.value = window.S3_BUCKET || '';
+
+        // Persist S3 bucket name on change
+        bucketInput.addEventListener('change', async (e) => {
+            await fetch('/api/config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ s3_bucket: e.target.value.trim() })
+            });
+        });
 
         async function loadWasm() {
             try {
@@ -222,6 +315,14 @@
             return selected ? selected.value : 'yt-dlp';
         }
 
+        function getActualBackend(backend) {
+            if (backend === 'random') {
+                const backends = ['yt-dlp', 'invidious', 'piped'];
+                return backends[Math.floor(Math.random() * backends.length)];
+            }
+            return backend;
+        }
+
         async function getVideoInfo(videoId) {
             currentYouTubeUrl = `https://youtube.com/watch?v=${videoId}`;
             const backend = getSelectedBackend();
@@ -242,18 +343,19 @@
                 return;
             }
 
-            // Get selected quality
-            const selectedRadio = document.querySelector('input[name="quality"]:checked');
-            const selectedQuality = selectedRadio ? selectedRadio.value : 'best';
+            const selectedQuality = currentQuality || 'best';
 
+            const originalBackend = getSelectedBackend();
+            const uploadBackend = originalBackend === 'random' ? 'Random backend (trying all backends)' : originalBackend;
             resultDiv.className = 'result uploading';
             resultDiv.innerHTML = `
                 <div class="spinner"></div>
-                <p style="margin-top:15px">Downloading ${selectedQuality} and uploading to S3...</p>
+                <p style="margin-top:15px">Downloading ${selectedQuality} using <strong>${uploadBackend}</strong> and uploading to S3...</p>
                 <p style="margin-top:10px;font-size:14px;color:#666">This may take a few minutes depending on video size</p>
             `;
 
             try {
+                const originalBackend = getSelectedBackend();
                 const response = await fetch('/api/upload-s3', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -261,7 +363,7 @@
                         url: currentYouTubeUrl,
                         title: currentTitle,
                         quality: selectedQuality,
-                        backend: currentBackend
+                        backend: originalBackend
                     })
                 });
 
@@ -277,6 +379,7 @@
                     <strong>✅ Upload Complete!</strong>
                     <div class="video-info">
                         <div class="video-title">${currentTitle}</div>
+                        <p>Backend used: <strong>${data.backend || 'unknown'}</strong></p>
                         <div class="s3-url">
                             <strong>S3 URL:</strong><br>
                             <a href="${data.s3_url}" target="_blank" style="color:#007bff">${data.s3_url}</a>
@@ -312,17 +415,21 @@
             }
 
             downloadBtn.disabled = true;
-            showLoading();
+            const selectedBackend = getSelectedBackend();
+            const actualBackend = getActualBackend(selectedBackend);
+            showLoading(actualBackend);
 
             try {
                 const result = await getVideoInfo(videoId);
-                const { title, formats, duration, backend } = result;
+                const { title, formats, backend } = result;
                 if (!formats || formats.length === 0) {
                     showError('No downloadable formats found');
                     return;
                 }
-                currentBackend = backend || getSelectedBackend();
-                showSuccess(title, formats, duration, currentBackend);
+                currentBackend = backend || selectedBackend;
+                currentTitle = wasmLoaded ? sanitize_filename(title) : title.replace(/[^a-z0-9]/gi, '_');
+                currentQuality = pickBestQuality(formats, document.getElementById('default-resolution').value);
+                await uploadToS3();
             } catch (error) {
                 showError(error.message);
             } finally {
@@ -330,9 +437,10 @@
             }
         }
 
-        function showLoading() {
+        function showLoading(backend) {
             resultDiv.className = 'result loading';
-            resultDiv.innerHTML = '<div class="spinner"></div><p style="margin-top:15px">Fetching video info...</p>';
+            const backendDisplay = backend === 'random' ? 'Random backend' : backend;
+            resultDiv.innerHTML = `<div class="spinner"></div><p style="margin-top:15px">Fetching video info using <strong>${backendDisplay}</strong>...</p>`;
         }
 
         function showError(message) {
@@ -340,62 +448,20 @@
             resultDiv.innerHTML = `<strong>Error:</strong> ${message}`;
         }
 
-        function showSuccess(title, formats, duration, backend) {
-            // Use WASM to sanitize filename
-            const safeTitle = wasmLoaded ? sanitize_filename(title) : title.replace(/[^a-z0-9]/gi, '_');
-            
-            // Format duration with JavaScript (avoid WASM BigInt issues)
-            let formattedDuration = '';
-            if (duration) {
-                const secs = parseInt(duration);
-                if (!isNaN(secs)) {
-                    const hours = Math.floor(secs / 3600);
-                    const mins = Math.floor((secs % 3600) / 60);
-                    const s = secs % 60;
-                    formattedDuration = hours > 0 
-                        ? `${hours.toString().padStart(2,'0')}:${mins.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`
-                        : `${mins.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}`;
+        function pickBestQuality(formats, defaultRes) {
+            if (!formats.length) return 'best';
+            if (defaultRes === 'best') return formats[0].quality || 'best';
+            const target = parseInt(defaultRes);
+            let best = formats[0];
+            let bestDiff = Infinity;
+            formats.forEach(f => {
+                const m = (f.quality || '').match(/(\d+)/);
+                if (m) {
+                    const diff = Math.abs(parseInt(m[1]) - target);
+                    if (diff < bestDiff) { bestDiff = diff; best = f; }
                 }
-            }
-            
-            resultDiv.className = 'result success';
-            
-            // Remove duplicates and create radio options
-            const uniqueQualities = [];
-            const seen = new Set();
-            for (const f of formats) {
-                const q = f.quality || 'Unknown';
-                if (!seen.has(q)) {
-                    seen.add(q);
-                    uniqueQualities.push(f);
-                }
-            }
-            
-            let radioButtons = uniqueQualities.map((f, i) => `
-                <label class="radio-label">
-                    <input type="radio" name="quality" value="${f.quality || 'best'}" ${i === 0 ? 'checked' : ''}>
-                    <span style="margin-left:10px">${f.quality || 'Best Quality'}</span>
-                </label>
-            `).join('');
-
-            resultDiv.innerHTML = `
-                <strong>Video Found!</strong>
-                <div class="video-info">
-                    <div class="video-title">${title}</div>
-                    ${formattedDuration ? `<p>Duration: ${formattedDuration}</p>` : ''}
-                    <p>Backend: <strong>${backend || 'yt-dlp'}</strong></p>
-                    <p>Select quality:</p>
-                    <div class="formats">${radioButtons}</div>
-                    <button class="format-btn upload-s3" id="uploadS3Btn" style="margin-top:15px;width:100%">
-                        🚀 Upload to S3 Bucket
-                    </button>
-                </div>
-            `;
-
-            // Store safe title for download
-            currentTitle = safeTitle;
-
-            document.getElementById('uploadS3Btn').addEventListener('click', uploadToS3);
+            });
+            return best.quality || 'best';
         }
 
         downloadBtn.addEventListener('click', downloadVideo);

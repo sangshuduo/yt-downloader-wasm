@@ -39,3 +39,7 @@ Thumbs.db
 *.egg-info/
 dist/
 build/
+
+# Local config (contains bucket name and user preferences)
+config.json
+.serena
